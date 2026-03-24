@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>WMS Magazzino</title>
+<meta name="description" content="Gestione Magazzino — Carico, Scarico, Ordini, Giacenze">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="data:application/json;base64,eyJuYW1lIjoiV01TIE1hZ2F6emlubyIsInNob3J0X25hbWUiOiJXTVMiLCJzdGFydF91cmwiOiIuIiwiZGlzcGxheSI6InN0YW5kYWxvbmUiLCJiYWNrZ3JvdW5kX2NvbG9yIjoiI2Y4ZmFmYyIsInRoZW1lX2NvbG9yIjoiIzE2YTM0YSJ9">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { font-family:'Segoe UI',system-ui,-apple-system,sans-serif; background:#f8fafc; overscroll-behavior:none; }
+  input,select,button { font-family:inherit; }
+  input:focus,select:focus { border-color:#16a34a !important; }
+  #root { max-width:600px; margin:0 auto; min-height:100vh; }
+  /* html5-qrcode override */
+  #wms-scanner-region video { object-fit:cover !important; }
+  #wms-scanner-region img[alt="Info icon"] { display:none !important; }
+  @keyframes scanline { 0%,100%{top:4px} 50%{top:100px} }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WMS MAGAZZINO — BETA 2 STANDALONE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const CATEGORIE = ["Latticini/Formaggi","Salumi/Carni","Pasta/Cereali","Conserve/Sughi",
+                   "Frutta/Verdura","Bevande","Surgelati","Pane/Forno","Condimenti/Spezie","Altro"];
+const GRUPPI_MERCEOLOGICI = ["Alimentari Freschi","Alimentari Secchi","Bevande","Surgelati",
+                              "Ortofrutta","Gastronomia","Panificati","Non Alimentari","Altro"];
+const UNITA  = ["kg","g","L","pz","cartone","busta","conf","vasetto","collo","bottiglia"];
+const TIPI   = ["Secco","Fresco","Surgelato"];
+const STORE_KEY = "wms_beta2";
+const GIORNI_ALERT_SCADENZA = 14;
+const GIORNI_ALERT_STOCK = 7;
+const GIORNI_CONSUMO_CALC = 60;
+
+// ─── UTILITY ─────────────────────────────────────────────────────────────────
+const uid      = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+const oggiStr  = () => new Date().toISOString().split("T")[0];
+const fmtData  = d => d ? new Date(d+"T00:00:00").toLocaleDateString("it-IT") : "—";
+const fmtDt    = d => d ? new Date(d).toLocaleString("it-IT") : "—";
+const giorniRimasti = exp => {
+  if (!exp) return null;
+  return Math.ceil((new Date(exp+"T23:59:59") - new Date()) / 86400000);
+};
+
+// ─── STORAGE (localStorage) ──────────────────────────────────────────────────
+const emptyDB = () => ({ products:[], inventory:[], movements:[], orders:[], clients:[], suppliers:[], nextOrderNum:1 });
+
+function dbLoad() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) return migrateDB(JSON.parse(raw));
+    // Migrazione da beta1
+    const old = localStorage.getItem("wms_beta1");
+    if (old) {
+      const d = JSON.parse(old);
+      return migrateDB({ ...emptyDB(), products:d.products||[], inventory:d.inventory||[], movements:d.movements||[] });
+    }
+    return null;
+  } catch { return null; }
+}
+
+function migrateDB(d) {
+  if (!d.orders) d.orders = [];
+  if (!d.clients) d.clients = [];
+  if (!d.suppliers) d.suppliers = [];
+  if (!d.nextOrderNum) d.nextOrderNum = (d.orders?.length||0)+1;
+  d.products = (d.products||[]).map(p => ({ supplier:"", group:"Altro", ...p }));
+  return d;
+}
+
+function dbSave(d) {
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(d)); } catch(e) { console.error("storage err:",e); }
+}
+
+// ─── EXCEL EXPORT ────────────────────────────────────────────────────────────
+async function loadXLSX() {
+  if (window.XLSX) return window.XLSX;
+  await new Promise((res,rej) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    s.onload = res; s.onerror = rej; document.head.appendChild(s);
+  });
+  return window.XLSX;
+}
+
+async function esportaExcel(data) {
+  const XLSX = await loadXLSX();
+  const wb = XLSX.utils.book_new();
+  const fprod = data.products.map(p => ({
+    Nome:p.name, Barcode:p.barcode, Categoria:p.category, Tipo:p.type,
+    "Unità":p.unit, Fornitore:p.supplier||"", "Gruppo Merceologico":p.group||""
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(fprod.length?fprod:[{nota:"Nessun prodotto"}]), "Prodotti");
+  const fgiac = data.inventory.filter(i=>i.qty>0).map(i => {
+    const p = data.products.find(x=>x.id===i.productId);
+    return { Prodotto:p?.name||"?", Barcode:p?.barcode||"", Lotto:i.lot, Scadenza:i.expiry||"",
+      "Giorni rimasti":giorniRimasti(i.expiry)??"", "Quantità":i.qty, "Peso (kg)":i.weight||"",
+      "Unità":i.unit, Posizione:i.location||"", "Data carico":i.entryDate };
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(fgiac.length?fgiac:[{nota:"Nessuna giacenza"}]), "Giacenza");
+  const fmov = data.movements.map(m => {
+    const p = data.products.find(x=>x.id===m.productId);
+    return { Data:fmtDt(m.date), Tipo:m.type, Prodotto:p?.name||"?", Lotto:m.lot||"", "Quantità":m.qty, "Peso (kg)":m.weight||"", Note:m.notes||"" };
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(fmov.length?fmov:[{nota:"Nessun movimento"}]), "Movimenti");
+  const ford = data.orders.map(o => ({
+    "N°":o.orderNum, Cliente:o.clientName, Stato:o.status==="closed"?"Chiuso":"Aperto",
+    Articoli:o.items.length, "Data creazione":fmtDt(o.createdAt), "Data chiusura":o.closedAt?fmtDt(o.closedAt):""
+  }));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(ford.length?ford:[{nota:"Nessun ordine"}]), "Ordini");
+  XLSX.writeFile(wb, `Magazzino_${oggiStr()}.xlsx`);
+}
+
+// ─── STAMPA ORDINE ───────────────────────────────────────────────────────────
+function stampaOrdine(ordine, data) {
+  const items = ordine.items.map(it => {
+    const p = data.products.find(x=>x.id===it.productId);
+    return { ...it, prodName:p?.name||"?", prodBarcode:p?.barcode||"", prodUnit:p?.unit||it.unit||"" };
+  });
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Ordine ${ordine.orderNum}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;padding:24px;max-width:800px;margin:0 auto;color:#111}
+h1{font-size:22px;margin-bottom:4px} h2{font-size:15px;color:#555;margin-bottom:20px}
+.info{display:flex;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px}
+.info div{font-size:13px;line-height:1.6}
+.info strong{display:block;font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.5px}
+table{width:100%;border-collapse:collapse;margin:16px 0}
+th{background:#f0f0f0;text-align:left;padding:10px 12px;font-size:12px;font-weight:700;border-bottom:2px solid #ddd}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid #eee}
+.sig{display:flex;justify-content:space-between;margin-top:50px;padding-top:12px}
+.sig div{width:45%;border-top:1px solid #999;padding-top:8px;font-size:12px;color:#555}
+.footer{margin-top:30px;padding-top:16px;border-top:2px solid #ddd;font-size:12px;color:#888;text-align:center}
+@media print{body{padding:12px}@page{margin:1cm}}
+</style></head><body>
+<h1>📦 Documento di Trasporto</h1>
+<h2>Ordine N° ${ordine.orderNum}</h2>
+<div class="info">
+  <div><strong>Cliente</strong>${ordine.clientName}</div>
+  <div><strong>Data creazione</strong>${fmtDt(ordine.createdAt)}</div>
+  <div><strong>Data chiusura</strong>${ordine.closedAt?fmtDt(ordine.closedAt):"—"}</div>
+  <div><strong>Stato</strong>${ordine.status==="closed"?"Chiuso":"Aperto"}</div>
+</div>
+<table><thead><tr><th>#</th><th>Prodotto</th><th>Barcode</th><th>Lotto</th><th>Scadenza</th><th>Qt.</th><th>Peso</th></tr></thead><tbody>
+${items.map((it,i) => `<tr><td>${i+1}</td><td>${it.prodName}</td><td style="font-family:monospace">${it.prodBarcode}</td><td>${it.lot||"—"}</td><td>${it.expiry?fmtData(it.expiry):"—"}</td><td>${it.qty} ${it.prodUnit}</td><td>${it.weight?it.weight+" kg":"—"}</td></tr>`).join("")}
+</tbody></table>
+${ordine.notes?`<p style="margin-top:12px;font-size:13px"><strong>Note:</strong> ${ordine.notes}</p>`:""}
+<div class="sig"><div>Firma mittente</div><div>Firma destinatario</div></div>
+<div class="footer">Generato da WMS Magazzino · ${fmtDt(new Date().toISOString())}</div>
+</body></html>`;
+  const w = window.open("","_blank");
+  if(w){w.document.write(html);w.document.close();setTimeout(()=>w.print(),400);}
+  else{ const blob=new Blob([html],{type:"text/html"}); const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=`Ordine_${ordine.orderNum}_${oggiStr()}.html`; a.click(); }
+}
+
+// ─── BEEP ────────────────────────────────────────────────────────────────────
+function beep() {
+  try {
+    const a=new AudioContext(),o=a.createOscillator(),g=a.createGain();
+    o.connect(g);g.connect(a.destination);o.type="sine";o.frequency.value=1200;g.gain.value=0.3;
+    o.start();o.stop(a.currentTime+0.12);
+  } catch{}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCANNER — html5-qrcode + BarcodeDetector nativo + manuale
+// ═══════════════════════════════════════════════════════════════════════════════
+function Scanner({ onScan, onClose }) {
+  const containerRef = useRef();
+  const scannerRef = useRef(null);
+  const videoRef = useRef();
+  const streamRef = useRef();
+  const rafRef = useRef();
+  const [err, setErr] = useState("");
+  const [manuale, setManuale] = useState("");
+  const [metodo, setMetodo] = useState("loading");
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      // Tentativo 1: html5-qrcode
+      try {
+        if (window.Html5Qrcode && containerRef.current) {
+          const sc = new Html5Qrcode("wms-scanner-region");
+          scannerRef.current = sc;
+          await sc.start(
+            { facingMode: "environment" },
+            { fps: 12, qrbox: { width: 280, height: 140 }, aspectRatio: 1.5,
+              formatsToSupport: [
+                Html5QrcodeSupportedFormats.QR_CODE,
+                Html5QrcodeSupportedFormats.EAN_13,
+                Html5QrcodeSupportedFormats.EAN_8,
+                Html5QrcodeSupportedFormats.CODE_128,
+                Html5QrcodeSupportedFormats.CODE_39,
+                Html5QrcodeSupportedFormats.CODE_93,
+                Html5QrcodeSupportedFormats.UPC_A,
+                Html5QrcodeSupportedFormats.UPC_E,
+                Html5QrcodeSupportedFormats.ITF,
+                Html5QrcodeSupportedFormats.PDF_417,
+                Html5QrcodeSupportedFormats.DATA_MATRIX,
+              ]
+            },
+            (text) => { beep(); sc.stop().catch(()=>{}); onScan(text); },
+            () => {}
+          );
+          if(!cancelled) setMetodo("html5qr");
+          return;
+        }
+      } catch(e) { console.warn("html5-qrcode fail:", e); }
+
+      // Tentativo 2: BarcodeDetector nativo
+      if (!cancelled) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode:"environment", width:{ideal:1280}, height:{ideal:720} }
+          });
+          if(cancelled){ stream.getTracks().forEach(t=>t.stop()); return; }
+          streamRef.current = stream;
+          if(videoRef.current){ videoRef.current.srcObject=stream; await videoRef.current.play(); }
+          if("BarcodeDetector" in window) {
+            const det = new BarcodeDetector({ formats:["code_128","code_39","ean_13","ean_8","qr_code","pdf417","upc_a","upc_e","data_matrix","code_93","itf"] });
+            setMetodo("native");
+            const scan = async () => {
+              if(!videoRef.current) return;
+              try { const codes=await det.detect(videoRef.current); if(codes.length){ stopNative(); beep(); onScan(codes[0].rawValue); return; } } catch{}
+              rafRef.current = requestAnimationFrame(scan);
+            };
+            rafRef.current = requestAnimationFrame(scan);
+            return;
+          } else { stream.getTracks().forEach(t=>t.stop()); }
+        } catch(e) { console.warn("native fail:", e); }
+      }
+      if(!cancelled) { setMetodo("manual"); setErr("Fotocamera non disponibile. Inserisci il codice manualmente."); }
+    })();
+    return () => { cancelled=true; stopAll(); };
+  }, []);
+
+  function stopNative() {
+    if(rafRef.current) cancelAnimationFrame(rafRef.current);
+    streamRef.current?.getTracks().forEach(t=>t.stop());
+  }
+  function stopAll() {
+    stopNative();
+    if(scannerRef.current){ try{scannerRef.current.stop();}catch{} }
+  }
+  function handleClose(){ stopAll(); onClose(); }
+  function handleManuale(){ if(manuale.trim()){ stopAll(); onScan(manuale.trim()); }}
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"#0a0a0a",zIndex:9999,display:"flex",flexDirection:"column"}}>
+      <div style={{padding:"14px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid #1f2937"}}>
+        <div>
+          <p style={{margin:0,color:"#fff",fontWeight:700,fontSize:17}}>📷 Scansiona Barcode</p>
+          <p style={{margin:0,color:"#6b7280",fontSize:12}}>
+            {metodo==="loading"?"Avvio scanner…":metodo==="html5qr"?"Scanner attivo (multi-formato)":metodo==="native"?"Scanner nativo":"Inserimento manuale"}
+          </p>
+        </div>
+        <button onClick={handleClose} style={{background:"#1f2937",color:"#fff",border:"none",borderRadius:10,padding:"10px 18px",cursor:"pointer",fontWeight:700,fontSize:15}}>✕ Chiudi</button>
+      </div>
+      <div style={{flex:1,position:"relative",overflow:"hidden",background:"#000"}}>
+        <div id="wms-scanner-region" ref={containerRef} style={{width:"100%",height:"100%"}} />
+        {metodo==="native" && <video ref={videoRef} style={{position:"absolute",inset:0,width:"100%",height:"100%",objectFit:"cover"}} muted playsInline />}
+        {metodo==="native" && (
+          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+            <div style={{width:280,height:120,border:"3px solid #22c55e",borderRadius:6,boxShadow:"0 0 0 100vw rgba(0,0,0,0.45)"}}>
+              <div style={{position:"absolute",left:4,right:4,height:2,background:"linear-gradient(to right,transparent,#22c55e,transparent)",animation:"scanline 1.4s ease-in-out infinite"}}/>
+            </div>
+          </div>
+        )}
+        {metodo==="loading" && (
+          <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <div style={{textAlign:"center",color:"#6b7280"}}><div style={{fontSize:48,marginBottom:12,animation:"pulse 1.5s infinite"}}>📷</div><p style={{fontSize:15,fontWeight:600}}>Avvio fotocamera…</p></div>
+          </div>
+        )}
+        {err && <div style={{position:"absolute",bottom:0,left:0,right:0,background:"rgba(220,38,38,0.9)",padding:"12px 16px"}}><p style={{margin:0,color:"#fff",fontSize:13,textAlign:"center"}}>{err}</p></div>}
+      </div>
+      <div style={{padding:16,background:"#111"}}>
+        <p style={{color:"#6b7280",textAlign:"center",fontSize:13,marginBottom:10}}>— oppure inserisci manualmente —</p>
+        <div style={{display:"flex",gap:8}}>
+          <input value={manuale} onChange={e=>setManuale(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")handleManuale();}}
+            placeholder="Digita il codice barcode..." style={{flex:1,padding:"14px",borderRadius:12,border:"2px solid #374151",background:"#1f2937",color:"#fff",fontSize:16,outline:"none"}} autoComplete="off" inputMode="text"/>
+          <button onClick={handleManuale} style={{padding:"14px 22px",background:"#16a34a",color:"#fff",border:"none",borderRadius:12,fontSize:20,cursor:"pointer",fontWeight:700}}>✓</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODAL PRODOTTO
+// ═══════════════════════════════════════════════════════════════════════════════
+function ModalProdotto({ prodotto, suppliers, onSalva, onChiudi }) {
+  const [form, setForm] = useState(prodotto || {name:"",barcode:"",category:"Altro",type:"Secco",unit:"kg",desc:"",supplier:"",group:"Altro"});
+  const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
+  const S={width:"100%",padding:"13px 14px",borderRadius:11,fontSize:15,boxSizing:"border-box",border:"1.5px solid #d1d5db",background:"#fff",outline:"none"};
+  const L={display:"block",fontSize:13,fontWeight:700,color:"#374151",marginBottom:5};
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:500,display:"flex",alignItems:"flex-end",justifyContent:"center"}}>
+      <div style={{background:"#fff",width:"100%",maxWidth:520,borderRadius:"20px 20px 0 0",padding:"24px 20px 32px",maxHeight:"92vh",overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+          <h2 style={{margin:0,fontSize:20,fontWeight:800}}>{prodotto?"✏️ Modifica":"➕ Nuovo"} Prodotto</h2>
+          <button onClick={onChiudi} style={{background:"#f3f4f6",border:"none",borderRadius:8,padding:"8px 14px",cursor:"pointer",fontSize:18}}>✕</button>
+        </div>
+        <div style={{marginBottom:14}}><label style={L}>Nome prodotto *</label><input value={form.name} onChange={set("name")} placeholder="Es. Mozzarella Fior di Latte 125g" style={S}/></div>
+        <div style={{marginBottom:14}}><label style={L}>Codice Barcode *</label><input value={form.barcode} onChange={set("barcode")} placeholder="Es. MOZZ001 o 8001120" style={S}/></div>
+        <div style={{marginBottom:14}}>
+          <label style={L}>Fornitore</label>
+          <input value={form.supplier||""} onChange={set("supplier")} placeholder="Es. Latteria Sorrentina" list="supplier-list" style={S}/>
+          <datalist id="supplier-list">{suppliers.map(s=><option key={s} value={s}/>)}</datalist>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+          <div><label style={L}>Gruppo Merceologico</label><select value={form.group||"Altro"} onChange={set("group")} style={{...S,padding:"13px 8px"}}>{GRUPPI_MERCEOLOGICI.map(g=><option key={g}>{g}</option>)}</select></div>
+          <div><label style={L}>Categoria</label><select value={form.category} onChange={set("category")} style={{...S,padding:"13px 8px"}}>{CATEGORIE.map(c=><option key={c}>{c}</option>)}</select></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+          <div><label style={L}>Tipo</label><select value={form.type} onChange={set("type")} style={{...S,padding:"13px 8px"}}>{TIPI.map(t=><option key={t}>{t}</option>)}</select></div>
+          <div><label style={L}>Unità</label><select value={form.unit} onChange={set("unit")} style={{...S,padding:"13px 8px"}}>{UNITA.map(u=><option key={u}>{u}</option>)}</select></div>
+        </div>
+        <div style={{marginBottom:20}}><label style={L}>Note</label><input value={form.desc||""} onChange={set("desc")} placeholder="Opzionale" style={S}/></div>
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={onChiudi} style={{flex:1,padding:15,background:"#f3f4f6",border:"none",borderRadius:14,fontSize:15,cursor:"pointer",fontWeight:600}}>Annulla</button>
+          <button onClick={()=>{if(!form.name?.trim()||!form.barcode?.trim()){alert("Nome e barcode obbligatori.");return;} onSalva({...form,id:form.id||uid(),createdAt:form.createdAt||oggiStr()});}}
+            style={{flex:2,padding:15,background:"#16a34a",color:"#fff",border:"none",borderRadius:14,fontSize:15,fontWeight:800,cursor:"pointer"}}>💾 Salva</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODAL LOTTO
+// ═══════════════════════════════════════════════════════════════════════════════
+function ModalLotto({ lotto, prodotto, onSalva, onElimina, onChiudi }) {
+  const [form, setForm] = useState({...lotto});
+  const set = k => e => setForm(f=>({...f,[k]:e.target.value}));
+  const S={width:"100%",padding:"13px 14px",borderRadius:11,fontSize:15,boxSizing:"border-box",border:"1.5px solid #d1d5db",background:"#fff",outline:"none"};
+  const L={display:"block",fontSize:13,fontWeight:700,color:"#374151",marginBottom:5};
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:500,display:"flex",alignItems:"flex-end",justifyContent:"center"}}>
+      <div style={{background:"#fff",width:"100%",maxWidth:520,borderRadius:"20px 20px 0 0",padding:"24px 20px 32px",maxHeight:"92vh",overflowY:"auto"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:22}}>
+          <h2 style={{margin:0,fontSize:18,fontWeight:800}}>✏️ Modifica Lotto</h2>
+          <button onClick={onChiudi} style={{background:"#f3f4f6",border:"none",borderRadius:8,padding:"8px 14px",cursor:"pointer",fontSize:18}}>✕</button>
+        </div>
+        <p style={{fontSize:14,color:"#6b7280",marginBottom:16}}>Prodotto: <strong>{prodotto?.name}</strong></p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+          <div><label style={L}>Lotto</label><input value={form.lot} onChange={set("lot")} style={S}/></div>
+          <div><label style={L}>Scadenza</label><input value={form.expiry||""} onChange={set("expiry")} type="date" style={S}/></div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
+          <div><label style={L}>Quantità</label><input value={form.qty} onChange={e=>setForm(f=>({...f,qty:parseFloat(e.target.value)||0}))} type="number" step="0.01" style={S}/></div>
+          <div><label style={L}>Peso (kg)</label><input value={form.weight||""} onChange={e=>setForm(f=>({...f,weight:e.target.value?parseFloat(e.target.value):null}))} type="number" step="0.01" style={S}/></div>
+          <div><label style={L}>Unità</label><select value={form.unit} onChange={set("unit")} style={{...S,padding:"13px 8px"}}>{UNITA.map(u=><option key={u}>{u}</option>)}</select></div>
+        </div>
+        <div style={{marginBottom:14}}><label style={L}>Posizione</label><input value={form.location||""} onChange={set("location")} style={S}/></div>
+        <div style={{marginBottom:20}}><label style={L}>Note</label><input value={form.notes||""} onChange={set("notes")} style={S}/></div>
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={()=>onElimina(form.id)} style={{padding:15,background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:14,fontSize:14,cursor:"pointer",fontWeight:700}}>🗑️</button>
+          <button onClick={onChiudi} style={{flex:1,padding:15,background:"#f3f4f6",border:"none",borderRadius:14,fontSize:15,cursor:"pointer",fontWeight:600}}>Annulla</button>
+          <button onClick={()=>onSalva(form)} style={{flex:2,padding:15,background:"#16a34a",color:"#fff",border:"none",borderRadius:14,fontSize:15,fontWeight:800,cursor:"pointer"}}>💾 Salva</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CARD GIACENZA
+// ═══════════════════════════════════════════════════════════════════════════════
+function CardGiacenza({ prodotto: p, lotti, totale, consumoGiornaliero, onEditLotto }) {
+  const [aperto, setAperto] = useState(false);
+  const minGiorni = lotti.length ? Math.min(...lotti.map(l=>giorniRimasti(l.expiry)??999)) : 999;
+  const giorniStock = consumoGiornaliero>0 ? Math.round(totale/consumoGiornaliero) : null;
+  const borderCol = minGiorni<0?"#fca5a5":minGiorni<=GIORNI_ALERT_SCADENZA?"#fde68a":totale>0?"#d1fae5":"#f3f4f6";
+  const typeIcon = p.type==="Fresco"?"🥩":p.type==="Surgelato"?"🧊":"🧺";
+
+  return (
+    <div style={{background:"#fff",borderRadius:14,marginBottom:10,border:`2px solid ${borderCol}`,overflow:"hidden"}}>
+      <div onClick={()=>setAperto(a=>!a)} style={{padding:"14px 16px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center",userSelect:"none"}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}>
+            <span style={{fontSize:16}}>{typeIcon}</span>
+            <p style={{margin:0,fontWeight:700,fontSize:15,color:"#111",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</p>
+          </div>
+          <p style={{margin:0,fontSize:12,color:"#6b7280"}}>{p.supplier&&<><strong>{p.supplier}</strong> · </>}{p.category} · {lotti.length} lott{lotti.length===1?"o":"i"}</p>
+          {p.group&&p.group!=="Altro"&&<span style={{fontSize:10,background:"#ede9fe",color:"#6d28d9",borderRadius:4,padding:"1px 6px",fontWeight:600}}>{p.group}</span>}
+        </div>
+        <div style={{textAlign:"right",marginLeft:12,flexShrink:0}}>
+          <p style={{margin:"0 0 2px",fontWeight:800,fontSize:18,color:"#166534"}}>{totale} <span style={{fontSize:13,fontWeight:600}}>{p.unit}</span></p>
+          {giorniStock!==null&&<p style={{margin:0,fontSize:11,fontWeight:700,color:giorniStock<=GIORNI_ALERT_STOCK?"#dc2626":"#6b7280"}}>{giorniStock<=GIORNI_ALERT_STOCK?"⚠️ ":""}~{giorniStock}gg scorta</p>}
+          <span style={{fontSize:11,color:"#9ca3af"}}>{aperto?"▲ chiudi":"▼ lotti"}</span>
+        </div>
+      </div>
+      {aperto&&(
+        <div style={{borderTop:"1px solid #f3f4f6",padding:"8px 14px 14px"}}>
+          {lotti.length===0&&<p style={{color:"#9ca3af",fontSize:13,margin:"8px 0"}}>Nessun lotto.</p>}
+          {lotti.map(l=>{
+            const d=giorniRimasti(l.expiry);
+            const bg=d===null?"#f9fafb":d<0?"#fef2f2":d<=7?"#fffbeb":d<=GIORNI_ALERT_SCADENZA?"#fefce8":"#fafafa";
+            const tc=d===null?"#374151":d<0?"#dc2626":d<=7?"#d97706":"#16a34a";
+            return (
+              <div key={l.id} style={{background:bg,borderRadius:11,padding:"11px 13px",marginBottom:8,border:"1px solid #f3f4f6"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                  <div style={{flex:1}}>
+                    <p style={{margin:"0 0 3px",fontWeight:700,fontSize:14}}>Lotto: <span style={{fontFamily:"monospace"}}>{l.lot}</span></p>
+                    <p style={{margin:"0 0 1px",fontSize:13,color:"#374151"}}>Qt: <strong>{l.qty} {l.unit}</strong>{l.weight!=null?<> · Peso: <strong>{l.weight} kg</strong></>:""}</p>
+                    {l.location&&<p style={{margin:0,fontSize:12,color:"#6b7280"}}>📍 {l.location}</p>}
+                    <p style={{margin:"2px 0 0",fontSize:11,color:"#9ca3af"}}>Carico: {fmtData(l.entryDate)}</p>
+                  </div>
+                  <div style={{textAlign:"right",flexShrink:0}}>
+                    {l.expiry?(<div style={{background:d<0?"#fee2e2":d<=7?"#fef9c3":"#dcfce7",borderRadius:8,padding:"4px 8px",marginBottom:6}}>
+                      <p style={{margin:0,fontSize:11,fontWeight:800,color:tc}}>{d<0?`⛔ ${Math.abs(d)}gg fa`:d===0?"⚠️ Oggi!":d<=7?`⚠️ ${d}gg`:fmtData(l.expiry)}</p>
+                    </div>):<span style={{fontSize:11,color:"#9ca3af"}}>No scad.</span>}
+                    <button onClick={(e)=>{e.stopPropagation();onEditLotto(l);}}
+                      style={{fontSize:11,color:"#1d4ed8",background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:7,padding:"4px 10px",cursor:"pointer",fontWeight:600}}>✏️ Modifica</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// APP PRINCIPALE
+// ═══════════════════════════════════════════════════════════════════════════════
+function WMS() {
+  const [data, setData] = useState(emptyDB());
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("home");
+  const [search, setSearch] = useState("");
+  const [toast, setToast] = useState(null);
+  const [confirm, setConfirm] = useState(null);
+  const [scanner, setScanner] = useState(null);
+  const [modalProd, setModalProd] = useState(null);
+  const [modalLotto, setModalLotto] = useState(null);
+  const [filtroFornitore, setFiltroFornitore] = useState("");
+  const [filtroGruppo, setFiltroGruppo] = useState("");
+  const [car, setCar] = useState({step:"scan",code:"",productId:"",lot:"",expiry:"",qty:"",weight:"",unit:"kg",location:"",notes:""});
+  const [sca, setSca] = useState({step:"scan",code:"",productId:"",lotId:"",qty:"",notes:""});
+  const [ordTab, setOrdTab] = useState("lista");
+  const [ordineCorrente, setOrdineCorrente] = useState(null);
+  const [ordDettaglio, setOrdDettaglio] = useState(null);
+  const [ordClientName, setOrdClientName] = useState("");
+  const [ordNotes, setOrdNotes] = useState("");
+  const [ordItemStep, setOrdItemStep] = useState("idle");
+  const [ordItemProduct, setOrdItemProduct] = useState(null);
+  const [ordItemLotId, setOrdItemLotId] = useState("");
+  const [ordItemQty, setOrdItemQty] = useState("");
+  const [ordItemWeight, setOrdItemWeight] = useState("");
+
+  useEffect(() => { const d=dbLoad(); if(d) setData(d); setLoading(false); }, []);
+  const aggiorna = useCallback(d => { setData(d); dbSave(d); }, []);
+  const notify = (msg,err=false) => { setToast({msg,err}); setTimeout(()=>setToast(null),3000); };
+
+  const getLotti = pid => data.inventory.filter(i=>i.productId===pid&&i.qty>0).sort((a,b)=>(a.expiry||"9")>(b.expiry||"9")?1:-1);
+  const getTotale = pid => getLotti(pid).reduce((s,i)=>s+i.qty,0);
+  const getConsumo = pid => {
+    const cutoff=new Date(); cutoff.setDate(cutoff.getDate()-GIORNI_CONSUMO_CALC);
+    const scarichi=data.movements.filter(m=>m.productId===pid&&m.type==="SCARICO"&&new Date(m.date)>=cutoff);
+    if(!scarichi.length) return 0;
+    return scarichi.reduce((s,m)=>s+m.qty,0)/GIORNI_CONSUMO_CALC;
+  };
+
+  const inScadenza = data.inventory.filter(i=>{const d=giorniRimasti(i.expiry);return i.qty>0&&d!==null&&d<=GIORNI_ALERT_SCADENZA&&d>=0;});
+  const scaduti = data.inventory.filter(i=>{const d=giorniRimasti(i.expiry);return i.qty>0&&d!==null&&d<0;});
+  const prodottiBassaScorta = data.products.filter(p=>{const tot=getTotale(p.id);if(!tot)return false;const c=getConsumo(p.id);return c>0&&(tot/c)<=GIORNI_ALERT_STOCK;});
+  const suppliersList = [...new Set(data.products.map(p=>p.supplier).filter(Boolean))].sort();
+
+  // CARICO
+  function onCaricoScan(code){setScanner(null);const p=data.products.find(x=>x.barcode===code);setCar(c=>({...c,step:"form",code,productId:p?.id||"",unit:p?.unit||"kg"}));if(!p)notify("⚠️ Barcode non in catalogo",true);}
+  function inviaCarico(){
+    if(!car.productId||!car.qty){notify("Seleziona prodotto e quantità",true);return;}
+    const id=uid();
+    const entry={id,productId:car.productId,lot:car.lot.trim()||("LOT-"+uid().slice(0,6).toUpperCase()),expiry:car.expiry||null,qty:parseFloat(car.qty),weight:car.weight?parseFloat(car.weight):null,unit:car.unit,location:car.location.trim(),notes:car.notes.trim(),entryDate:oggiStr()};
+    const mov={id:uid(),type:"CARICO",productId:car.productId,inventoryEntryId:id,lot:entry.lot,qty:entry.qty,weight:entry.weight,date:new Date().toISOString(),notes:entry.notes};
+    aggiorna({...data,inventory:[...data.inventory,entry],movements:[mov,...data.movements]});
+    notify("✅ Carico registrato!");
+    setCar({step:"scan",code:"",productId:"",lot:"",expiry:"",qty:"",weight:"",unit:"kg",location:"",notes:""});
+  }
+
+  // SCARICO
+  function onScaricoScan(code){setScanner(null);const p=data.products.find(x=>x.barcode===code);setSca(s=>({...s,step:"form",code,productId:p?.id||""}));if(!p)notify("⚠️ Barcode non in catalogo",true);}
+  function inviaScarico(){
+    if(!sca.productId||!sca.lotId||!sca.qty){notify("Compila prodotto, lotto e quantità",true);return;}
+    const lotto=data.inventory.find(i=>i.id===sca.lotId);if(!lotto){notify("Lotto non trovato",true);return;}
+    const q=parseFloat(sca.qty);if(q>lotto.qty){notify(`Max: ${lotto.qty} ${lotto.unit}`,true);return;}
+    const newInv=data.inventory.map(i=>i.id===sca.lotId?{...i,qty:+(i.qty-q).toFixed(4)}:i);
+    const mov={id:uid(),type:"SCARICO",productId:sca.productId,inventoryEntryId:sca.lotId,lot:lotto.lot,qty:q,date:new Date().toISOString(),notes:sca.notes.trim()};
+    aggiorna({...data,inventory:newInv,movements:[mov,...data.movements]});
+    notify("✅ Scarico registrato!");
+    setSca({step:"scan",code:"",productId:"",lotId:"",qty:"",notes:""});
+  }
+
+  // ORDINI
+  function creaOrdine(){
+    if(!ordClientName.trim()){notify("Inserisci il nome del cliente",true);return;}
+    const ord={id:uid(),orderNum:data.nextOrderNum,clientName:ordClientName.trim(),items:[],notes:ordNotes.trim(),status:"open",createdAt:new Date().toISOString(),closedAt:null};
+    let nc=[...data.clients];
+    if(!nc.find(c=>c.name.toLowerCase()===ord.clientName.toLowerCase()))nc.push({id:uid(),name:ord.clientName,createdAt:oggiStr()});
+    const nd={...data,orders:[ord,...data.orders],clients:nc,nextOrderNum:data.nextOrderNum+1};
+    aggiorna(nd);setOrdineCorrente(ord);setOrdTab("dettaglio");setOrdDettaglio(ord);setOrdClientName("");setOrdNotes("");notify("📋 Ordine #"+ord.orderNum+" creato!");
+  }
+  function onOrdineScan(code){
+    setScanner(null);const p=data.products.find(x=>x.barcode===code);
+    if(!p){notify("⚠️ Barcode non in catalogo",true);return;}
+    setOrdItemProduct(p);setOrdItemStep("select_lot");
+  }
+  function aggiungiItemOrdine(){
+    if(!ordItemProduct||!ordItemLotId||!ordItemQty){notify("Compila tutti i campi",true);return;}
+    const lotto=data.inventory.find(i=>i.id===ordItemLotId);if(!lotto)return;
+    const q=parseFloat(ordItemQty);if(q>lotto.qty){notify(`Max: ${lotto.qty}`,true);return;}
+    const item={productId:ordItemProduct.id,lotId:ordItemLotId,lot:lotto.lot,expiry:lotto.expiry,qty:q,weight:ordItemWeight?parseFloat(ordItemWeight):null,unit:ordItemProduct.unit};
+    const updOrd={...ordDettaglio,items:[...ordDettaglio.items,item]};
+    aggiorna({...data,orders:data.orders.map(o=>o.id===updOrd.id?updOrd:o)});
+    setOrdDettaglio(updOrd);setOrdineCorrente(updOrd);
+    setOrdItemStep("idle");setOrdItemProduct(null);setOrdItemLotId("");setOrdItemQty("");setOrdItemWeight("");
+    notify("✅ Articolo aggiunto!");
+  }
+  function rimuoviItemOrdine(idx){
+    const updOrd={...ordDettaglio,items:ordDettaglio.items.filter((_,i)=>i!==idx)};
+    aggiorna({...data,orders:data.orders.map(o=>o.id===updOrd.id?updOrd:o)});
+    setOrdDettaglio(updOrd);setOrdineCorrente(updOrd);
+  }
+  function chiudiOrdine(){
+    if(!ordDettaglio||!ordDettaglio.items.length){notify("Aggiungi almeno un articolo",true);return;}
+    let newInv=[...data.inventory],newMov=[...data.movements];
+    for(const item of ordDettaglio.items){
+      newInv=newInv.map(i=>i.id===item.lotId?{...i,qty:+(i.qty-item.qty).toFixed(4)}:i);
+      newMov.unshift({id:uid(),type:"SCARICO",productId:item.productId,inventoryEntryId:item.lotId,lot:item.lot,qty:item.qty,weight:item.weight,date:new Date().toISOString(),notes:`Ordine #${ordDettaglio.orderNum} — ${ordDettaglio.clientName}`});
+    }
+    const updOrd={...ordDettaglio,status:"closed",closedAt:new Date().toISOString()};
+    aggiorna({...data,inventory:newInv,movements:newMov,orders:data.orders.map(o=>o.id===updOrd.id?updOrd:o)});
+    setOrdDettaglio(updOrd);setOrdineCorrente(null);notify("🔒 Ordine #"+updOrd.orderNum+" chiuso!");
+  }
+  function eliminaOrdine(ordId){
+    aggiorna({...data,orders:data.orders.filter(o=>o.id!==ordId)});
+    setOrdDettaglio(null);setOrdineCorrente(null);setOrdTab("lista");notify("🗑️ Ordine eliminato");
+  }
+
+  const inpStyle={width:"100%",padding:"13px 14px",borderRadius:11,border:"1.5px solid #d1d5db",fontSize:15,boxSizing:"border-box",outline:"none",background:"#fff"};
+  const lblStyle={display:"block",fontSize:13,fontWeight:700,color:"#374151",marginBottom:5};
+
+  if(loading) return (<div style={{height:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"#f0fdf4"}}><div style={{fontSize:72}}>📦</div><p style={{fontWeight:800,color:"#166534",fontSize:20,margin:"16px 0 0"}}>Caricamento…</p></div>);
+
+  // ═══════════════════ VISTE ═══════════════════
+
+  const vistaHome = () => {
+    const nProd=new Set(data.inventory.filter(i=>i.qty>0).map(i=>i.productId)).size;
+    const ordAperti=data.orders.filter(o=>o.status==="open");
+    return (
+      <div style={{padding:"18px 16px 90px"}}>
+        <div style={{marginBottom:20}}><h1 style={{margin:"0 0 2px",fontSize:26,fontWeight:900,color:"#166534"}}>📦 WMS Magazzino</h1><p style={{margin:0,color:"#6b7280",fontSize:13}}>Beta 2 · {fmtDt(new Date().toISOString())}</p></div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:20}}>
+          {[{v:nProd,l:"Prodotti in stock",i:"🏷️",bg:"#dbeafe",tc:"#1e40af"},{v:data.inventory.filter(i=>i.qty>0).length,l:"Lotti attivi",i:"📋",bg:"#dcfce7",tc:"#166534"},{v:inScadenza.length+scaduti.length,l:`Scadenze (≤${GIORNI_ALERT_SCADENZA}gg)`,i:"⚠️",bg:"#fef9c3",tc:"#854d0e"},{v:ordAperti.length,l:"Ordini aperti",i:"📝",bg:"#ede9fe",tc:"#5b21b6"}].map(({v,l,i,bg,tc})=>(
+            <div key={l} style={{background:bg,borderRadius:16,padding:"16px 14px"}}><div style={{fontSize:30}}>{i}</div><div style={{fontSize:36,fontWeight:900,color:tc,lineHeight:1.1,margin:"4px 0"}}>{v}</div><div style={{fontSize:11,color:tc,fontWeight:700}}>{l}</div></div>
+          ))}
+        </div>
+        {prodottiBassaScorta.length>0&&(<div style={{marginBottom:16}}><h3 style={{fontSize:14,fontWeight:700,color:"#dc2626",margin:"0 0 10px"}}>🚨 Scorta bassa</h3>
+          {prodottiBassaScorta.map(p=>{const tot=getTotale(p.id),c=getConsumo(p.id),gg=c>0?Math.round(tot/c):null;return(
+            <div key={p.id} style={{background:"#fef2f2",borderRadius:11,padding:"10px 14px",marginBottom:8,border:"1.5px solid #fca5a5",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><p style={{margin:0,fontWeight:700,fontSize:14}}>{p.name}</p><p style={{margin:0,fontSize:12,color:"#6b7280"}}>Stock: {tot} {p.unit}</p></div><span style={{fontWeight:800,fontSize:13,color:"#dc2626"}}>~{gg}gg</span></div>
+          );})}</div>)}
+        {(scaduti.length>0||inScadenza.length>0)&&(<div style={{marginBottom:16}}><h3 style={{fontSize:14,fontWeight:700,color:"#374151",margin:"0 0 10px"}}>⚠️ Scadenze</h3>
+          {[...scaduti,...inScadenza].slice(0,8).map(i=>{const p=data.products.find(x=>x.id===i.productId),d=giorniRimasti(i.expiry);return(
+            <div key={i.id} style={{background:d<0?"#fef2f2":"#fffbeb",borderRadius:11,padding:"10px 14px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center",border:`1.5px solid ${d<0?"#fca5a5":"#fde68a"}`}}><div><p style={{margin:0,fontWeight:700,fontSize:14}}>{p?.name||"?"}</p><p style={{margin:0,fontSize:12,color:"#6b7280"}}>Lotto: {i.lot} · {i.qty} {i.unit}</p></div><span style={{fontWeight:800,fontSize:13,color:d<0?"#dc2626":"#b45309"}}>{d<0?`${Math.abs(d)}gg fa`:d===0?"OGGI":`${d}gg`}</span></div>
+          );})}</div>)}
+        {ordAperti.length>0&&(<div style={{marginBottom:16}}><h3 style={{fontSize:14,fontWeight:700,margin:"0 0 10px"}}>📝 Ordini aperti</h3>
+          {ordAperti.slice(0,4).map(o=>(<div key={o.id} onClick={()=>{setTab("ordini");setOrdTab("dettaglio");setOrdDettaglio(o);setOrdineCorrente(o);}} style={{background:"#f5f3ff",borderRadius:11,padding:"10px 14px",marginBottom:8,border:"1.5px solid #ddd6fe",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><p style={{margin:0,fontWeight:700,fontSize:14}}>#{o.orderNum} — {o.clientName}</p><p style={{margin:0,fontSize:12,color:"#6b7280"}}>{o.items.length} art. · {fmtDt(o.createdAt)}</p></div><span>→</span></div>))}</div>)}
+        <h3 style={{fontSize:14,fontWeight:700,margin:"0 0 10px"}}>🕐 Ultimi movimenti</h3>
+        {data.movements.slice(0,6).map(m=>{const p=data.products.find(x=>x.id===m.productId);return(
+          <div key={m.id} style={{background:"#fff",borderRadius:11,padding:"10px 14px",marginBottom:8,border:"1.5px solid #f3f4f6",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><div style={{display:"flex",alignItems:"center",gap:6,marginBottom:2}}><span style={{fontSize:11,fontWeight:800,color:"#fff",background:m.type==="CARICO"?"#16a34a":"#dc2626",borderRadius:5,padding:"2px 7px"}}>{m.type}</span><span style={{fontWeight:700,fontSize:14}}>{p?.name||"?"}</span></div><p style={{margin:0,fontSize:11,color:"#9ca3af"}}>{fmtDt(m.date)} · qt. {m.qty}</p></div><span style={{fontSize:18}}>{m.type==="CARICO"?"📥":"📤"}</span></div>
+        );})}
+        {!data.movements.length&&<p style={{textAlign:"center",padding:"30px 0",color:"#9ca3af"}}>Nessun movimento.</p>}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:16}}>
+          <button onClick={()=>setTab("carico")} style={{padding:"16px",background:"#16a34a",color:"#fff",border:"none",borderRadius:14,fontWeight:800,fontSize:15,cursor:"pointer"}}>📥 Carico</button>
+          <button onClick={()=>setTab("ordini")} style={{padding:"16px",background:"#7c3aed",color:"#fff",border:"none",borderRadius:14,fontWeight:800,fontSize:15,cursor:"pointer"}}>📝 Ordini</button>
+        </div>
+      </div>
+    );
+  };
+
+  const vistaCarico = () => {
+    if(car.step==="scan") return (<div style={{padding:"40px 20px",textAlign:"center"}}><div style={{fontSize:80,marginBottom:12}}>📥</div><h2 style={{fontSize:24,fontWeight:900,color:"#166534",margin:"0 0 8px"}}>Carico Merce</h2><p style={{color:"#6b7280",fontSize:15,marginBottom:36}}>Scansiona o inserisci manualmente.</p>
+      <button onClick={()=>setScanner("carico")} style={{width:"100%",padding:"18px",background:"#16a34a",color:"#fff",border:"none",borderRadius:16,fontSize:18,fontWeight:800,cursor:"pointer",marginBottom:14}}>📷 Scansiona Barcode</button>
+      <button onClick={()=>setCar(c=>({...c,step:"form"}))} style={{width:"100%",padding:"16px",background:"#f0fdf4",color:"#166534",border:"2px solid #16a34a",borderRadius:16,fontSize:16,fontWeight:700,cursor:"pointer"}}>✍️ Manuale</button></div>);
+    const prodSel=data.products.find(x=>x.id===car.productId);
+    return (<div style={{padding:"16px 16px 90px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}><button onClick={()=>setCar({step:"scan",code:"",productId:"",lot:"",expiry:"",qty:"",weight:"",unit:"kg",location:"",notes:""})} style={{background:"#f3f4f6",border:"none",borderRadius:10,padding:"9px 16px",cursor:"pointer",fontSize:14,fontWeight:600}}>← Indietro</button><h2 style={{margin:0,fontSize:19,fontWeight:800,color:"#166534"}}>📥 Carico</h2></div>
+      {car.code&&<div style={{background:"#f0fdf4",border:"1.5px solid #bbf7d0",borderRadius:11,padding:"10px 14px",marginBottom:14}}>📟 <strong style={{fontFamily:"monospace"}}>{car.code}</strong></div>}
+      <div style={{marginBottom:14}}><label style={lblStyle}>Prodotto *</label><select value={car.productId} onChange={e=>{const p=data.products.find(x=>x.id===e.target.value);setCar(c=>({...c,productId:e.target.value,unit:p?.unit||c.unit}));}} style={{...inpStyle,background:"#fff"}}><option value="">— Seleziona —</option>{data.products.map(p=><option key={p.id} value={p.id}>{p.name} ({p.barcode})</option>)}</select></div>
+      {prodSel?.type==="Fresco"&&<div style={{background:"#fffbeb",border:"1.5px solid #fde68a",borderRadius:11,padding:"10px 14px",marginBottom:14}}><p style={{margin:0,fontSize:13,color:"#854d0e",fontWeight:600}}>🥩 Fresco — inserisci peso consegna</p></div>}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}><div><label style={lblStyle}>Lotto</label><input value={car.lot} onChange={e=>setCar(c=>({...c,lot:e.target.value}))} placeholder="Auto" style={inpStyle}/></div><div><label style={lblStyle}>Scadenza</label><input value={car.expiry} onChange={e=>setCar(c=>({...c,expiry:e.target.value}))} type="date" style={inpStyle}/></div></div>
+      <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr",gap:10,marginBottom:14}}><div><label style={lblStyle}>Qt *</label><input value={car.qty} onChange={e=>setCar(c=>({...c,qty:e.target.value}))} type="number" style={inpStyle}/></div><div><label style={lblStyle}>Unità</label><select value={car.unit} onChange={e=>setCar(c=>({...c,unit:e.target.value}))} style={{...inpStyle,padding:"13px 8px"}}>{UNITA.map(u=><option key={u}>{u}</option>)}</select></div><div><label style={lblStyle}>Peso kg</label><input value={car.weight} onChange={e=>setCar(c=>({...c,weight:e.target.value}))} type="number" step="0.01" style={inpStyle}/></div></div>
+      <div style={{marginBottom:12}}><label style={lblStyle}>Posizione</label><input value={car.location} onChange={e=>setCar(c=>({...c,location:e.target.value}))} style={inpStyle}/></div>
+      <div style={{marginBottom:20}}><label style={lblStyle}>Note</label><input value={car.notes} onChange={e=>setCar(c=>({...c,notes:e.target.value}))} style={inpStyle}/></div>
+      <button onClick={inviaCarico} style={{width:"100%",padding:"18px",background:"#16a34a",color:"#fff",border:"none",borderRadius:16,fontSize:17,fontWeight:800,cursor:"pointer"}}>✅ Conferma Carico</button>
+      <button onClick={()=>setScanner("carico")} style={{width:"100%",padding:"13px",background:"transparent",color:"#16a34a",border:"2px solid #16a34a",borderRadius:14,fontSize:14,fontWeight:600,cursor:"pointer",marginTop:10}}>📷 Scansiona altro</button>
+    </div>);
+  };
+
+  const vistaScarico = () => {
+    const lotti=sca.productId?getLotti(sca.productId):[];
+    if(sca.step==="scan") return (<div style={{padding:"40px 20px",textAlign:"center"}}><div style={{fontSize:80,marginBottom:12}}>📤</div><h2 style={{fontSize:24,fontWeight:900,color:"#dc2626",margin:"0 0 8px"}}>Scarico Merce</h2><p style={{color:"#6b7280",fontSize:15,marginBottom:36}}>Scansiona o seleziona manualmente.</p>
+      <button onClick={()=>setScanner("scarico")} style={{width:"100%",padding:"18px",background:"#dc2626",color:"#fff",border:"none",borderRadius:16,fontSize:18,fontWeight:800,cursor:"pointer",marginBottom:14}}>📷 Scansiona</button>
+      <button onClick={()=>setSca(s=>({...s,step:"form"}))} style={{width:"100%",padding:"16px",background:"#fff5f5",color:"#dc2626",border:"2px solid #dc2626",borderRadius:16,fontSize:16,fontWeight:700,cursor:"pointer"}}>✍️ Manuale</button></div>);
+    return (<div style={{padding:"16px 16px 90px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}><button onClick={()=>setSca({step:"scan",code:"",productId:"",lotId:"",qty:"",notes:""})} style={{background:"#f3f4f6",border:"none",borderRadius:10,padding:"9px 16px",cursor:"pointer",fontSize:14,fontWeight:600}}>← Indietro</button><h2 style={{margin:0,fontSize:19,fontWeight:800,color:"#dc2626"}}>📤 Scarico</h2></div>
+      {sca.code&&<div style={{background:"#fff5f5",border:"1.5px solid #fca5a5",borderRadius:11,padding:"10px 14px",marginBottom:14}}>📟 <strong style={{fontFamily:"monospace"}}>{sca.code}</strong></div>}
+      <div style={{marginBottom:14}}><label style={lblStyle}>Prodotto *</label><select value={sca.productId} onChange={e=>setSca(s=>({...s,productId:e.target.value,lotId:""}))} style={{...inpStyle,background:"#fff"}}><option value="">— Seleziona —</option>{data.products.filter(p=>getLotti(p.id).length>0).map(p=><option key={p.id} value={p.id}>{p.name} — {getTotale(p.id)} {p.unit}</option>)}</select></div>
+      {sca.productId&&!lotti.length&&<div style={{background:"#fef2f2",borderRadius:11,padding:"14px",marginBottom:14,border:"1.5px solid #fca5a5"}}><p style={{margin:0,color:"#dc2626",fontWeight:700}}>⛔ Nessuna giacenza.</p></div>}
+      {sca.productId&&lotti.length>0&&(<div style={{marginBottom:14}}><label style={lblStyle}>Lotto *</label>{lotti.map(l=>{const d=giorniRimasti(l.expiry),sel=sca.lotId===l.id;return(<div key={l.id} onClick={()=>setSca(s=>({...s,lotId:l.id}))} style={{background:sel?"#dbeafe":"#fff",border:`2px solid ${sel?"#3b82f6":"#e5e7eb"}`,borderRadius:12,padding:"12px 14px",marginBottom:8,cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><p style={{margin:0,fontWeight:700,fontSize:14}}>Lotto: {l.lot}</p><p style={{margin:"2px 0 0",fontSize:13}}>Disp: <strong>{l.qty} {l.unit}</strong></p></div><div style={{textAlign:"right"}}>{l.expiry&&<span style={{fontSize:11,fontWeight:700,padding:"4px 8px",borderRadius:7,background:d<0?"#fee2e2":d<=7?"#fef9c3":"#dcfce7",color:d<0?"#dc2626":d<=7?"#d97706":"#166534"}}>{d<0?`SCAD`:d<=7?`${d}gg`:fmtData(l.expiry)}</span>}{sel&&<p style={{margin:"4px 0 0",fontSize:12,color:"#3b82f6",fontWeight:700}}>✓</p>}</div></div>);})}</div>)}
+      <div style={{marginBottom:12}}><label style={lblStyle}>Quantità *</label><input value={sca.qty} onChange={e=>setSca(s=>({...s,qty:e.target.value}))} type="number" step="0.01" style={inpStyle}/></div>
+      <div style={{marginBottom:20}}><label style={lblStyle}>Note</label><input value={sca.notes} onChange={e=>setSca(s=>({...s,notes:e.target.value}))} style={inpStyle}/></div>
+      <button onClick={inviaScarico} style={{width:"100%",padding:"18px",background:"#dc2626",color:"#fff",border:"none",borderRadius:16,fontSize:17,fontWeight:800,cursor:"pointer"}}>✅ Conferma Scarico</button>
+    </div>);
+  };
+
+  const vistaGiacenza = () => {
+    let pf=data.products.filter(p=>(!search||p.name.toLowerCase().includes(search.toLowerCase())||p.barcode.toLowerCase().includes(search.toLowerCase())||(p.supplier||"").toLowerCase().includes(search.toLowerCase()))&&(!filtroFornitore||p.supplier===filtroFornitore)&&(!filtroGruppo||p.group===filtroGruppo));
+    const cg=pf.filter(p=>getTotale(p.id)>0),sg=pf.filter(p=>getTotale(p.id)===0&&search);
+    return (<div style={{padding:"16px 16px 90px"}}>
+      <h2 style={{fontSize:20,fontWeight:900,margin:"0 0 14px"}}>📦 Giacenze</h2>
+      <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca…" style={{...inpStyle,marginBottom:10}}/>
+      <div style={{display:"flex",gap:8,marginBottom:14}}><select value={filtroFornitore} onChange={e=>setFiltroFornitore(e.target.value)} style={{padding:"8px 10px",borderRadius:9,border:"1.5px solid #d1d5db",fontSize:13,background:"#fff",flex:1}}><option value="">Tutti fornitori</option>{suppliersList.map(s=><option key={s}>{s}</option>)}</select><select value={filtroGruppo} onChange={e=>setFiltroGruppo(e.target.value)} style={{padding:"8px 10px",borderRadius:9,border:"1.5px solid #d1d5db",fontSize:13,background:"#fff",flex:1}}><option value="">Tutti gruppi</option>{GRUPPI_MERCEOLOGICI.map(g=><option key={g}>{g}</option>)}</select></div>
+      {!cg.length&&!search&&!filtroFornitore&&!filtroGruppo&&<div style={{textAlign:"center",padding:"40px 20px",color:"#9ca3af"}}><div style={{fontSize:60}}>📦</div><p style={{fontWeight:700,marginTop:12}}>Magazzino vuoto</p></div>}
+      {cg.map(p=><CardGiacenza key={p.id} prodotto={p} lotti={getLotti(p.id)} totale={getTotale(p.id)} consumoGiornaliero={getConsumo(p.id)} onEditLotto={l=>setModalLotto({lotto:l,prodotto:p})}/>)}
+      {sg.length>0&&<div><p style={{fontSize:13,color:"#9ca3af",fontWeight:600,margin:"16px 0 8px"}}>Senza giacenza:</p>{sg.map(p=><div key={p.id} style={{background:"#f9fafb",borderRadius:11,padding:"12px 14px",marginBottom:8,opacity:0.7}}><p style={{margin:0,fontWeight:700,fontSize:14,color:"#9ca3af"}}>{p.name}</p></div>)}</div>}
+    </div>);
+  };
+
+  const vistaOrdini = () => {
+    if(ordTab==="lista"){
+      const ap=data.orders.filter(o=>o.status==="open"),ch=data.orders.filter(o=>o.status==="closed");
+      return (<div style={{padding:"16px 16px 90px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><h2 style={{margin:0,fontSize:20,fontWeight:900}}>📝 Ordini</h2><button onClick={()=>setOrdTab("nuovo")} style={{background:"#7c3aed",color:"#fff",border:"none",borderRadius:10,padding:"10px 18px",cursor:"pointer",fontWeight:800,fontSize:14}}>＋ Nuovo</button></div>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca cliente…" style={{...inpStyle,marginBottom:14}}/>
+        {ap.length>0&&<h3 style={{fontSize:14,fontWeight:700,color:"#5b21b6",margin:"0 0 10px"}}>📋 Aperti ({ap.length})</h3>}
+        {ap.filter(o=>!search||o.clientName.toLowerCase().includes(search.toLowerCase())||String(o.orderNum).includes(search)).map(o=>(<div key={o.id} onClick={()=>{setOrdDettaglio(o);setOrdineCorrente(o);setOrdTab("dettaglio");}} style={{background:"#faf5ff",borderRadius:13,padding:"14px 16px",marginBottom:10,border:"2px solid #ddd6fe",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><p style={{margin:0,fontWeight:800,fontSize:16,color:"#5b21b6"}}>#{o.orderNum} — {o.clientName}</p><p style={{margin:"4px 0 0",fontSize:12,color:"#6b7280"}}>{o.items.length} art. · {fmtDt(o.createdAt)}</p></div><span style={{fontSize:11,fontWeight:700,background:"#ede9fe",color:"#7c3aed",borderRadius:6,padding:"4px 10px"}}>APERTO</span></div></div>))}
+        {ch.length>0&&<h3 style={{fontSize:14,fontWeight:700,margin:"16px 0 10px"}}>✅ Chiusi ({ch.length})</h3>}
+        {ch.filter(o=>!search||o.clientName.toLowerCase().includes(search.toLowerCase())||String(o.orderNum).includes(search)).map(o=>(<div key={o.id} onClick={()=>{setOrdDettaglio(o);setOrdineCorrente(null);setOrdTab("dettaglio");}} style={{background:"#fff",borderRadius:13,padding:"14px 16px",marginBottom:10,border:"1.5px solid #e5e7eb",cursor:"pointer"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}><div><p style={{margin:0,fontWeight:700,fontSize:15}}>#{o.orderNum} — {o.clientName}</p><p style={{margin:"4px 0 0",fontSize:12,color:"#6b7280"}}>{o.items.length} art. · {fmtDt(o.closedAt)}</p></div><span style={{fontSize:11,fontWeight:700,background:"#dcfce7",color:"#166534",borderRadius:6,padding:"4px 10px"}}>CHIUSO</span></div></div>))}
+        {!data.orders.length&&<div style={{textAlign:"center",padding:"50px 20px",color:"#9ca3af"}}><div style={{fontSize:64}}>📝</div><p style={{fontWeight:700,marginTop:12}}>Nessun ordine</p></div>}
+      </div>);
+    }
+    if(ordTab==="nuovo"){
+      return (<div style={{padding:"16px 16px 90px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}><button onClick={()=>setOrdTab("lista")} style={{background:"#f3f4f6",border:"none",borderRadius:10,padding:"9px 16px",cursor:"pointer",fontSize:14,fontWeight:600}}>← Indietro</button><h2 style={{margin:0,fontSize:19,fontWeight:800,color:"#7c3aed"}}>📝 Nuovo Ordine</h2></div>
+        <div style={{marginBottom:14}}><label style={lblStyle}>Nome Cliente *</label><input value={ordClientName} onChange={e=>setOrdClientName(e.target.value)} placeholder="Es. Ristorante Da Mario" list="client-list" style={inpStyle}/><datalist id="client-list">{data.clients.map(c=><option key={c.id} value={c.name}/>)}</datalist></div>
+        <div style={{marginBottom:20}}><label style={lblStyle}>Note ordine</label><input value={ordNotes} onChange={e=>setOrdNotes(e.target.value)} placeholder="Opzionale" style={inpStyle}/></div>
+        <button onClick={creaOrdine} style={{width:"100%",padding:"18px",background:"#7c3aed",color:"#fff",border:"none",borderRadius:16,fontSize:17,fontWeight:800,cursor:"pointer"}}>📋 Crea Ordine</button>
+      </div>);
+    }
+    if(ordTab==="dettaglio"&&ordDettaglio){
+      const isOpen=ordDettaglio.status==="open";
+      const lottiD=ordItemProduct?getLotti(ordItemProduct.id):[];
+      return (<div style={{padding:"16px 16px 90px"}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:18}}><button onClick={()=>{setOrdTab("lista");setOrdDettaglio(null);setOrdineCorrente(null);setOrdItemStep("idle");}} style={{background:"#f3f4f6",border:"none",borderRadius:10,padding:"9px 16px",cursor:"pointer",fontSize:14,fontWeight:600}}>← Lista</button><h2 style={{margin:0,fontSize:18,fontWeight:800,color:isOpen?"#7c3aed":"#166534"}}>{isOpen?"📝":"✅"} Ordine #{ordDettaglio.orderNum}</h2></div>
+        <div style={{background:isOpen?"#faf5ff":"#f0fdf4",borderRadius:13,padding:"14px 16px",marginBottom:16,border:`1.5px solid ${isOpen?"#ddd6fe":"#bbf7d0"}`}}>
+          <p style={{margin:"0 0 4px",fontWeight:700,fontSize:16}}>{ordDettaglio.clientName}</p>
+          <p style={{margin:0,fontSize:12,color:"#6b7280"}}>Creato: {fmtDt(ordDettaglio.createdAt)}{ordDettaglio.closedAt&&<> · Chiuso: {fmtDt(ordDettaglio.closedAt)}</>}</p>
+          {ordDettaglio.notes&&<p style={{margin:"4px 0 0",fontSize:13}}>💬 {ordDettaglio.notes}</p>}
+          <span style={{display:"inline-block",marginTop:6,fontSize:11,fontWeight:700,background:isOpen?"#ede9fe":"#dcfce7",color:isOpen?"#7c3aed":"#166534",borderRadius:6,padding:"3px 10px"}}>{isOpen?"APERTO":"CHIUSO"}</span>
+        </div>
+        <h3 style={{fontSize:14,fontWeight:700,margin:"0 0 10px"}}>📦 Articoli ({ordDettaglio.items.length})</h3>
+        {!ordDettaglio.items.length&&<p style={{color:"#9ca3af",fontSize:13,marginBottom:16}}>Nessun articolo.</p>}
+        {ordDettaglio.items.map((it,idx)=>{const p=data.products.find(x=>x.id===it.productId);return(
+          <div key={idx} style={{background:"#fff",borderRadius:11,padding:"12px 14px",marginBottom:8,border:"1.5px solid #f3f4f6",display:"flex",justifyContent:"space-between",alignItems:"center"}}><div style={{flex:1}}><p style={{margin:0,fontWeight:700,fontSize:14}}>{p?.name||"?"}</p><p style={{margin:"2px 0 0",fontSize:12,color:"#6b7280"}}>Lotto: {it.lot} · Qt: {it.qty} {it.unit||p?.unit||""}{it.weight?` · ${it.weight}kg`:""}{it.expiry?` · ${fmtData(it.expiry)}`:""}</p></div>
+            {isOpen&&<button onClick={()=>setConfirm({msg:`Rimuovere ${p?.name}?`,cb:()=>rimuoviItemOrdine(idx)})} style={{background:"#fee2e2",color:"#dc2626",border:"none",borderRadius:8,padding:"6px 12px",cursor:"pointer",fontWeight:700,fontSize:12,marginLeft:8}}>🗑️</button>}</div>
+        );})}
+
+        {isOpen&&ordItemStep==="idle"&&(<div style={{marginTop:12,display:"flex",gap:8}}>
+          <button onClick={()=>setScanner("ordine")} style={{flex:1,padding:"14px",background:"#7c3aed",color:"#fff",border:"none",borderRadius:13,fontWeight:700,cursor:"pointer"}}>📷 Scansiona</button>
+          <button onClick={()=>setOrdItemStep("scan")} style={{flex:1,padding:"14px",background:"#f5f3ff",color:"#7c3aed",border:"2px solid #7c3aed",borderRadius:13,fontWeight:700,cursor:"pointer"}}>✍️ Seleziona</button>
+        </div>)}
+
+        {isOpen&&ordItemStep==="scan"&&(<div style={{background:"#f9fafb",borderRadius:13,padding:"14px",marginTop:12,border:"1.5px solid #e5e7eb"}}>
+          <label style={lblStyle}>Seleziona prodotto</label>
+          <select value={ordItemProduct?.id||""} onChange={e=>{const p=data.products.find(x=>x.id===e.target.value);setOrdItemProduct(p||null);if(p)setOrdItemStep("select_lot");}} style={{...inpStyle,background:"#fff"}}><option value="">— Scegli —</option>{data.products.filter(p=>getLotti(p.id).length>0).map(p=><option key={p.id} value={p.id}>{p.name} ({getTotale(p.id)})</option>)}</select>
+          <button onClick={()=>{setOrdItemStep("idle");setOrdItemProduct(null);}} style={{marginTop:8,fontSize:13,color:"#6b7280",background:"none",border:"none",cursor:"pointer"}}>Annulla</button>
+        </div>)}
+
+        {isOpen&&ordItemStep==="select_lot"&&ordItemProduct&&(<div style={{background:"#f9fafb",borderRadius:13,padding:"14px",marginTop:12,border:"1.5px solid #e5e7eb"}}>
+          <p style={{margin:"0 0 8px",fontWeight:700,fontSize:14}}>📦 {ordItemProduct.name}</p>
+          <label style={lblStyle}>Lotto</label>
+          {lottiD.map(l=>{const d=giorniRimasti(l.expiry),sel=ordItemLotId===l.id;return(<div key={l.id} onClick={()=>setOrdItemLotId(l.id)} style={{background:sel?"#ede9fe":"#fff",border:`2px solid ${sel?"#7c3aed":"#e5e7eb"}`,borderRadius:10,padding:"10px 12px",marginBottom:6,cursor:"pointer"}}><p style={{margin:0,fontWeight:700,fontSize:13}}>Lotto: {l.lot} — {l.qty} {l.unit}</p>{l.expiry&&<span style={{fontSize:11,color:d<0?"#dc2626":d<=7?"#d97706":"#6b7280"}}>{d<0?"Scaduto":d<=7?`${d}gg`:fmtData(l.expiry)}</span>}</div>);})}
+          {ordItemLotId&&(<div style={{marginTop:10}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10}}><div><label style={lblStyle}>Qt *</label><input value={ordItemQty} onChange={e=>setOrdItemQty(e.target.value)} type="number" step="0.01" style={inpStyle}/></div><div><label style={lblStyle}>Peso kg</label><input value={ordItemWeight} onChange={e=>setOrdItemWeight(e.target.value)} type="number" step="0.01" style={inpStyle}/></div></div>
+            <div style={{display:"flex",gap:8}}><button onClick={()=>{setOrdItemStep("idle");setOrdItemProduct(null);setOrdItemLotId("");setOrdItemQty("");setOrdItemWeight("");}} style={{flex:1,padding:12,background:"#f3f4f6",border:"none",borderRadius:10,cursor:"pointer",fontWeight:600}}>Annulla</button><button onClick={aggiungiItemOrdine} style={{flex:2,padding:12,background:"#7c3aed",color:"#fff",border:"none",borderRadius:10,cursor:"pointer",fontWeight:800}}>✅ Aggiungi</button></div>
+          </div>)}
+        </div>)}
+
+        <div style={{marginTop:20,display:"flex",flexDirection:"column",gap:10}}>
+          {isOpen&&ordDettaglio.items.length>0&&<button onClick={()=>setConfirm({msg:`Chiudere ordine #${ordDettaglio.orderNum}? Stock scaricato.`,cb:chiudiOrdine})} style={{width:"100%",padding:"18px",background:"#16a34a",color:"#fff",border:"none",borderRadius:16,fontSize:17,fontWeight:800,cursor:"pointer"}}>🔒 Chiudi e Scarica</button>}
+          <button onClick={()=>stampaOrdine(ordDettaglio,data)} style={{width:"100%",padding:"14px",background:"#1d4ed8",color:"#fff",border:"none",borderRadius:13,fontSize:15,fontWeight:700,cursor:"pointer"}}>🖨️ Stampa DDT</button>
+          {isOpen&&<button onClick={()=>setConfirm({msg:`Eliminare ordine #${ordDettaglio.orderNum}?`,cb:()=>eliminaOrdine(ordDettaglio.id)})} style={{width:"100%",padding:"12px",background:"#fff",color:"#dc2626",border:"1.5px solid #fca5a5",borderRadius:13,fontSize:14,fontWeight:700,cursor:"pointer"}}>🗑️ Elimina</button>}
+        </div>
+      </div>);
+    }
+    return null;
+  };
+
+  const vistaProdotti = () => (<div style={{padding:"16px 16px 90px"}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}><h2 style={{margin:0,fontSize:20,fontWeight:900}}>🏷️ Prodotti</h2><button onClick={()=>setModalProd({})} style={{background:"#16a34a",color:"#fff",border:"none",borderRadius:10,padding:"10px 18px",cursor:"pointer",fontWeight:800,fontSize:14}}>＋ Nuovo</button></div>
+    <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca…" style={{...inpStyle,marginBottom:14}}/>
+    {data.products.filter(p=>!search||p.name.toLowerCase().includes(search.toLowerCase())||p.barcode.toLowerCase().includes(search.toLowerCase())||(p.supplier||"").toLowerCase().includes(search.toLowerCase())).map(p=>(<div key={p.id} style={{background:"#fff",borderRadius:13,padding:"14px 16px",marginBottom:10,border:"1.5px solid #f3f4f6"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}><div style={{flex:1,minWidth:0}}><p style={{margin:"0 0 3px",fontWeight:700,fontSize:15,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.name}</p><p style={{margin:"0 0 2px",fontSize:12,color:"#6b7280",fontFamily:"monospace"}}>📟 {p.barcode}</p><div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:4}}>{[p.category,p.type,p.unit].map(t=><span key={t} style={{fontSize:11,background:"#f3f4f6",borderRadius:5,padding:"2px 7px",fontWeight:600}}>{t}</span>)}{p.group&&p.group!=="Altro"&&<span style={{fontSize:11,background:"#ede9fe",color:"#6d28d9",borderRadius:5,padding:"2px 7px",fontWeight:600}}>{p.group}</span>}</div>{p.supplier&&<p style={{margin:0,fontSize:12,color:"#6b7280"}}>🏭 {p.supplier}</p>}<p style={{margin:"4px 0 0",fontSize:12,fontWeight:700,color:"#16a34a"}}>Stock: {getTotale(p.id)} {p.unit}</p></div><div style={{display:"flex",flexDirection:"column",gap:6,marginLeft:10,flexShrink:0}}><button onClick={()=>setModalProd(p)} style={{background:"#eff6ff",color:"#1e40af",border:"1.5px solid #bfdbfe",borderRadius:9,padding:"9px 14px",cursor:"pointer",fontWeight:700,fontSize:13}}>✏️</button><button onClick={()=>setConfirm({msg:`Eliminare ${p.name}?`,cb:()=>{aggiorna({...data,products:data.products.filter(x=>x.id!==p.id)});notify("Eliminato");}})} style={{background:"#fee2e2",color:"#dc2626",border:"1.5px solid #fca5a5",borderRadius:9,padding:"9px 14px",cursor:"pointer",fontWeight:700,fontSize:13}}>🗑️</button></div></div></div>))}
+    {!data.products.length&&<div style={{textAlign:"center",padding:"50px 20px",color:"#9ca3af"}}><div style={{fontSize:64}}>🏷️</div><p style={{fontWeight:700,marginTop:12}}>Nessun prodotto</p><button onClick={()=>setModalProd({})} style={{marginTop:16,padding:"14px 28px",background:"#16a34a",color:"#fff",border:"none",borderRadius:12,fontWeight:800,cursor:"pointer"}}>➕ Aggiungi</button></div>}
+  </div>);
+
+  const vistaStorico = () => (<div style={{padding:"16px 16px 90px"}}>
+    <h2 style={{fontSize:20,fontWeight:900,margin:"0 0 14px"}}>📋 Storico</h2>
+    <div style={{display:"flex",gap:8,marginBottom:16}}>
+      <button onClick={()=>esportaExcel(data).catch(e=>notify("Errore: "+e.message,true))} style={{flex:1,padding:"14px",background:"#1d4ed8",color:"#fff",border:"none",borderRadius:13,fontSize:14,fontWeight:800,cursor:"pointer"}}>📊 Excel</button>
+      <button onClick={()=>setConfirm({msg:"⚠️ RESET completo?",cb:()=>{aggiorna(emptyDB());notify("Reset");}})} style={{padding:"14px 18px",background:"#fff",color:"#dc2626",border:"1.5px solid #fca5a5",borderRadius:13,fontSize:14,fontWeight:700,cursor:"pointer"}}>🗑️ Reset</button>
+    </div>
+    {data.clients.length>0&&<div style={{marginBottom:20}}><h3 style={{fontSize:14,fontWeight:700,margin:"0 0 10px"}}>👥 Clienti ({data.clients.length})</h3><div style={{display:"flex",flexWrap:"wrap",gap:8}}>{data.clients.map(c=><span key={c.id} style={{background:"#f3f4f6",borderRadius:8,padding:"6px 12px",fontSize:13,fontWeight:600}}>{c.name}</span>)}</div></div>}
+    <h3 style={{fontSize:14,fontWeight:700,margin:"0 0 10px"}}>🕐 Movimenti</h3>
+    {!data.movements.length&&<p style={{textAlign:"center",color:"#9ca3af",marginTop:30}}>Nessun movimento.</p>}
+    {data.movements.map(m=>{const p=data.products.find(x=>x.id===m.productId);return(<div key={m.id} style={{background:"#fff",borderRadius:11,padding:"12px 14px",marginBottom:8,border:"1.5px solid #f3f4f6"}}><div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}><div style={{display:"flex",alignItems:"center",gap:7}}><span style={{fontSize:11,fontWeight:800,color:"#fff",background:m.type==="CARICO"?"#16a34a":"#dc2626",borderRadius:5,padding:"2px 8px"}}>{m.type}</span><span style={{fontWeight:700,fontSize:14}}>{p?.name||"?"}</span></div><span style={{fontSize:11,color:"#9ca3af",flexShrink:0}}>{fmtDt(m.date)}</span></div><p style={{margin:"5px 0 0",fontSize:12,color:"#374151"}}>Lotto: <strong style={{fontFamily:"monospace"}}>{m.lot||"—"}</strong> · Qt: {m.qty}{m.weight?` · ${m.weight}kg`:""}{m.notes?<><br/><span style={{color:"#6b7280"}}>💬 {m.notes}</span></>:""}</p></div>);})}
+  </div>);
+
+  const NAV=[["home","🏠","Home"],["carico","📥","Carico"],["ordini","📝","Ordini"],["giacenza","📦","Giacenze"],["prodotti","🏷️","Prodotti"],["storico","📋","Storico"]];
+
+  return (
+    <div style={{maxWidth:600,margin:"0 auto",minHeight:"100vh",background:"#f8fafc",fontFamily:"'Segoe UI',system-ui,-apple-system,sans-serif"}}>
+      {toast&&<div style={{position:"fixed",top:16,left:"50%",transform:"translateX(-50%)",background:toast.err?"#dc2626":"#16a34a",color:"#fff",padding:"12px 24px",borderRadius:14,zIndex:9000,fontSize:15,fontWeight:700,boxShadow:"0 8px 30px rgba(0,0,0,0.25)",maxWidth:"90vw",textAlign:"center"}}>{toast.msg}</div>}
+      {confirm&&(<div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:8000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}><div style={{background:"#fff",borderRadius:18,padding:24,maxWidth:360,width:"100%"}}><p style={{fontWeight:700,fontSize:16,textAlign:"center",marginBottom:20}}>{confirm.msg}</p><div style={{display:"flex",gap:10}}><button onClick={()=>setConfirm(null)} style={{flex:1,padding:14,background:"#f3f4f6",border:"none",borderRadius:12,cursor:"pointer",fontWeight:700}}>Annulla</button><button onClick={()=>{confirm.cb();setConfirm(null);}} style={{flex:1,padding:14,background:"#dc2626",color:"#fff",border:"none",borderRadius:12,cursor:"pointer",fontWeight:700}}>Conferma</button></div></div></div>)}
+      {scanner&&<Scanner onScan={scanner==="carico"?onCaricoScan:scanner==="scarico"?onScaricoScan:onOrdineScan} onClose={()=>setScanner(null)}/>}
+      {modalProd!==null&&<ModalProdotto prodotto={Object.keys(modalProd).length>0?modalProd:null} suppliers={suppliersList} onSalva={p=>{const ex=data.products.find(x=>x.id===p.id);aggiorna({...data,products:ex?data.products.map(x=>x.id===p.id?p:x):[...data.products,p]});setModalProd(null);notify("💾 Salvato!");}} onChiudi={()=>setModalProd(null)}/>}
+      {modalLotto&&<ModalLotto lotto={modalLotto.lotto} prodotto={modalLotto.prodotto} onSalva={l=>{aggiorna({...data,inventory:data.inventory.map(i=>i.id===l.id?l:i)});setModalLotto(null);notify("💾 Lotto aggiornato!");}} onElimina={id=>{setConfirm({msg:"Eliminare lotto?",cb:()=>{aggiorna({...data,inventory:data.inventory.filter(i=>i.id!==id)});setModalLotto(null);notify("Eliminato");}});}} onChiudi={()=>setModalLotto(null)}/>}
+      <div>
+        {tab==="home"&&vistaHome()}
+        {tab==="carico"&&vistaCarico()}
+        {tab==="scarico"&&vistaScarico()}
+        {tab==="giacenza"&&vistaGiacenza()}
+        {tab==="ordini"&&vistaOrdini()}
+        {tab==="prodotti"&&vistaProdotti()}
+        {tab==="storico"&&vistaStorico()}
+      </div>
+      <nav style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:600,background:"#fff",borderTop:"1px solid #e5e7eb",display:"flex",zIndex:200,boxShadow:"0 -4px 20px rgba(0,0,0,0.07)"}}>
+        {NAV.map(([id,icon,label])=>(<button key={id} onClick={()=>{setTab(id);setSearch("");setFiltroFornitore("");setFiltroGruppo("");}} style={{flex:1,padding:"9px 2px 7px",background:"none",border:"none",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:2,borderTop:tab===id?"3px solid #16a34a":"3px solid transparent"}}><span style={{fontSize:tab===id?24:20}}>{icon}</span><span style={{fontSize:9,fontWeight:tab===id?800:500,color:tab===id?"#16a34a":"#6b7280"}}>{label}</span></button>))}
+      </nav>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<WMS/>);
+</script>
+</body>
+</html>
